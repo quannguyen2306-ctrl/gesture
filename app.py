@@ -105,7 +105,6 @@ def main():
     min_tracking_confidence = args.min_tracking_confidence
 
     use_brect = True
-    print(cap_width, cap_height)
     # Camera preparation ###############################################################
     cap = cv.VideoCapture(cap_device)
     cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
