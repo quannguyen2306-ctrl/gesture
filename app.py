@@ -14,6 +14,31 @@ import mediapipe as mp
 from utils import CvFpsCalc
 from model import KeyPointClassifier
 from model import PointHistoryClassifier
+from queue import Queue
+import pygame
+import threading
+
+from explode import explode_frame
+from heart import apply_heart_filter
+from butterflies import apply_face_filter
+
+import math
+import time
+
+import multiprocessing as mtp
+
+# Sound playback function
+def play_sound(audio_file, queue):
+    # Load and play the audio file
+    pygame.mixer.init()
+    pygame.mixer.music.load(audio_file)
+    pygame.mixer.music.play()
+
+    # Wait for the sound to finish playing
+    while pygame.mixer.music.get_busy():
+        pass
+
+    # Signal that sound playback is complete
 
 
 def get_args():
@@ -27,7 +52,7 @@ def get_args():
     parser.add_argument("--min_detection_confidence",
                         help='min_detection_confidence',
                         type=float,
-                        default=0.7)
+                        default=0.9)
     parser.add_argument("--min_tracking_confidence",
                         help='min_tracking_confidence',
                         type=int,
@@ -37,6 +62,35 @@ def get_args():
 
     return args
 
+# Global variables 
+detection_buffer = mtp.Queue()
+captured = False
+captured_image = None
+show_captured_image = False
+
+temp_hand_sign_id = None
+flag_change_id = False
+counter = 0 
+
+# VTEAM-dectected trigger
+right_hand_landmarks = None 
+left_hand_landmarks = None
+counter_vteam = 0 
+vteam_flag = False
+
+# Countdown
+duration = 5
+start_time = 0
+end_time = 0
+
+# Screen-shot 
+max_alpha = 0.6
+max_thickness = 50
+current_alpha = 0 
+current_thickness = 0 
+animation_duration = 0.25 
+frame_rate = 30 
+screenshot_sound_flag = False
 
 def main():
     # Argument parsing #################################################################
@@ -51,17 +105,18 @@ def main():
     min_tracking_confidence = args.min_tracking_confidence
 
     use_brect = True
-
+    print(cap_width, cap_height)
     # Camera preparation ###############################################################
     cap = cv.VideoCapture(cap_device)
     cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
+    cap.set(cv.CAP_PROP_FPS, 29)
 
     # Model load #############################################################
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(
         static_image_mode=use_static_image_mode,
-        max_num_hands=1,
+        max_num_hands=2,
         min_detection_confidence=min_detection_confidence,
         min_tracking_confidence=min_tracking_confidence,
     )
@@ -98,7 +153,26 @@ def main():
     #  ########################################################################
     mode = 0
 
+    audio_files = ["/Users/nguyenhoangquan/Documents/side_project/photobooth_vteam/photobooth/handsign_recognition/gesture/y2mate.com - spiderman sound effect short.mp3",
+                   "/Users/nguyenhoangquan/Documents/side_project/photobooth_vteam/photobooth/handsign_recognition/gesture/y2mate.com - Camera Shutter Sound Effect.mp3"]
+    sound_queue = Queue()
+
+    def sound_manager(): 
+        while True: 
+            audio_file = sound_queue.get()
+            play_sound(audio_file, sound_queue)
+            sound_queue.task_done()
+
+    sound_thread = threading.Thread(target=sound_manager)
+    sound_thread.daemon = True
+    sound_thread.start()
+
+
+
     while True:
+        
+        global show_captured_image
+        global vteam_flag
         fps = cvFpsCalc.get()
 
         # Process Key (ESC: end) #################################################
@@ -113,39 +187,113 @@ def main():
             break
         image = cv.flip(image, 1)  # Mirror display
         debug_image = copy.deepcopy(image)
-
+        target_image = copy.deepcopy(image)
         # Detection implementation #############################################################
         image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
 
         image.flags.writeable = False
-        results = hands.process(image)
+
+        if not vteam_flag: 
+            results = hands.process(image)
         image.flags.writeable = True
+        
 
         #  ####################################################################
         if results.multi_hand_landmarks is not None:
             for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
                                                   results.multi_handedness):
+            
                 # Bounding box calculation
                 brect = calc_bounding_rect(debug_image, hand_landmarks)
                 # Landmark calculation
                 landmark_list = calc_landmark_list(debug_image, hand_landmarks)
+                
+                # print("####################################################################")
+                # print(landmark_list)
+
+                if handedness.classification[0].label == 'Right':
+                    global right_hand_landmarks
+                    right_hand_landmarks = landmark_list
+                elif handedness.classification[0].label == 'Left':
+                    global left_hand_landmarks
+                    left_hand_landmarks = landmark_list
+
 
                 # Conversion to relative coordinates / normalized coordinates
                 pre_processed_landmark_list = pre_process_landmark(
                     landmark_list)
                 pre_processed_point_history_list = pre_process_point_history(
                     debug_image, point_history)
+
                 # Write to the dataset file
                 logging_csv(number, mode, pre_processed_landmark_list,
                             pre_processed_point_history_list)
 
                 # Hand sign classification
                 hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
+                
+                global temp_hand_sign_id
+                global flag_change_id
+                if hand_sign_id != temp_hand_sign_id: 
+                    temp_hand_sign_id = hand_sign_id
+                    flag_change_id = True
+                else: 
+                    flag_change_id = False
+
                 if hand_sign_id == 2:  # Point gesture
                     point_history.append(landmark_list[8])
                 else:
                     point_history.append([0, 0])
 
+                # if hand_sign_id == 5 and flag_change_id: 
+                #     global counter
+                #     print(counter)
+                #     counter+=1 
+                #     sound_queue.put(audio_files[0])
+
+                global start_time
+                global end_time
+                global duration
+
+                if right_hand_landmarks and left_hand_landmarks and (vteam_flag is False):
+                    text = "VTEAM"
+                    font = cv.FONT_HERSHEY_SIMPLEX
+                    font_scale = 2
+                    font_thickness = 2
+                    text_color = (0, 255, 0)  # White color in BGR format
+
+                    # Get the size of the text to determine the position
+                    text_size = cv.getTextSize(text, font, font_scale, font_thickness)[0]
+                    text_width, text_height = text_size
+
+                    frame = image
+                    text_x = int((frame.shape[1] - text_width) / 2)  # Centered horizontally
+                    text_y = text_height + 10  # 10 pixels below the top edge
+
+
+                    # Check if middle finger tip of the right hand touches index finger pip or dip of the left hand
+                    right_middle_tip = right_hand_landmarks[12]
+                    left_index_pip = left_hand_landmarks[6]
+                    left_index_dip = left_hand_landmarks[7]
+
+                    # Calculate Euclidean distance between landmarks
+                    def euclidean_distance(point1, point2):
+                        return math.sqrt((point1[0] - point2[0]) ** 2 + (point1[1] - point2[1]) ** 2)
+
+                    distance_to_pip = euclidean_distance(right_middle_tip, left_index_pip)
+                    distance_to_dip = euclidean_distance(right_middle_tip, left_index_dip)
+
+                    bbox_coordinates = brect
+                    bbox_diagonal_distance = euclidean_distance((bbox_coordinates[0], bbox_coordinates[1]), (bbox_coordinates[2], bbox_coordinates[3]))
+                    # Define a threshold distance for touch detection
+                    touch_threshold = 13.0 + math.sqrt(bbox_diagonal_distance)  # Adjust this based on your application
+                    if distance_to_pip < touch_threshold or distance_to_dip < touch_threshold:
+                        cv.putText(debug_image, text, (text_x, text_y), font, font_scale, text_color, font_thickness)
+                        vteam_flag = True
+                        start_time = time.time()
+                        end_time = start_time + duration
+                        
+                
                 # Finger gesture classification
                 finger_gesture_id = 0
                 point_history_len = len(pre_processed_point_history_list)
@@ -159,23 +307,75 @@ def main():
                     finger_gesture_history).most_common()
 
                 # Drawing part
-                debug_image = draw_bounding_rect(use_brect, debug_image, brect)
-                debug_image = draw_landmarks(debug_image, landmark_list)
-                debug_image = draw_info_text(
-                    debug_image,
-                    brect,
-                    handedness,
-                    keypoint_classifier_labels[hand_sign_id],
-                    point_history_classifier_labels[most_common_fg_id[0][0]],
-                )
+                # debug_image = draw_bounding_rect(use_brect, debug_image, brect)
+                # debug_image = draw_landmarks(debug_image, landmark_list)
+                # debug_image = draw_info_text(
+                #     debug_image,
+                #     brect,
+                #     handedness,
+                #     keypoint_classifier_labels[hand_sign_id],
+                #     point_history_classifier_labels[most_common_fg_id[0][0]],
+                # )
         else:
             point_history.append([0, 0])
-
+        global screenshot_sound_flag
         debug_image = draw_point_history(debug_image, point_history)
         debug_image = draw_info(debug_image, fps, mode, number)
+        if vteam_flag: 
+            remaining_time = end_time - time.time()
+            if remaining_time >= 0:
+                countdown_text = "{:.1f}".format(remaining_time)
+                # Calculate progress (0 to 1) based on remaining time
+                progress = 1 - (remaining_time / duration)
+                draw_countdown(debug_image, countdown_text, progress)  # Draw countdown circle and text
+            else: 
 
-        # Screen reflection #############################################################
-        cv.imshow('Hand Gesture Recognition', debug_image)
+                global current_alpha
+                global max_alpha
+                global max_thickness
+                global current_thickness
+                global captured
+                global captured_image
+
+                overlay = np.ones_like(image) * 255  # White overlay (all pixels set to white)
+                # alpha values increase in each frame 
+                fps = 15
+                rate_overlay_increase = (max_alpha/fps) * 4  
+                rate_thickness_increase = int((max_thickness/fps)*7)
+
+                cv.addWeighted(overlay, current_alpha, debug_image, 1 - current_alpha, 0, debug_image)
+                cv.rectangle(debug_image, (0, 0), (frame.shape[1], frame.shape[0]),
+                      color=(0, 0, 0), thickness=current_thickness)
+                if not screenshot_sound_flag: 
+                    sound_queue.put(audio_files[1])
+                    screenshot_sound_flag = True
+                if current_alpha <= max_alpha and current_thickness <=max_thickness and not captured: 
+                    current_alpha += rate_overlay_increase
+                    current_thickness += rate_thickness_increase
+                else: 
+                    captured = True
+                    captured_image = target_image
+
+                if captured: 
+                    rate_overlay_decrease = (current_alpha/fps)*5
+                    rate_thickness_decrease = int((current_thickness/fps)*6)
+                    # print(current_alpha >= 0 and current_thickness >= 0)
+                    if round(current_alpha, 2) > 0 and current_thickness > 0:
+                        current_alpha -= rate_overlay_decrease
+                        current_thickness -= rate_thickness_decrease
+                    else: 
+                        # Restart
+                        show_captured_image = True
+                        screenshot_sound_flag = False
+                        captured = False
+                        start_time = time.time()
+                        end_time = start_time + duration
+
+        if show_captured_image: 
+            cv.imshow("Captured Image", captured_image)
+        
+        cv.imshow('Hand Gesture Recognition', ((debug_image)))
+        # yield debug_image
 
     cap.release()
     cv.destroyAllWindows()
@@ -206,9 +406,7 @@ def calc_bounding_rect(image, landmarks):
         landmark_point = [np.array((landmark_x, landmark_y))]
 
         landmark_array = np.append(landmark_array, landmark_point, axis=0)
-
     x, y, w, h = cv.boundingRect(landmark_array)
-
     return [x, y, x + w, y + h]
 
 
@@ -537,6 +735,50 @@ def draw_info(image, fps, mode, number):
                        cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1,
                        cv.LINE_AA)
     return image
+
+def draw_countdown(frame, text, progress):
+    font = cv.FONT_HERSHEY_SIMPLEX
+    text_size = cv.getTextSize(text, font, 2, 2)[0]
+    
+    # Calculate center coordinates for the circle and text
+    center_x = frame.shape[1] // 2
+    center_y = frame.shape[0] // 2
+    
+    # Draw the countdown text (black color)
+    cv.putText(frame, text, (center_x - text_size[0]//2, center_y + text_size[1]//2),
+                font, 2, (0, 0, 255), 2, cv.LINE_AA)
+    
+    # Draw the countdown circle (circle line representing progress)
+    radius = min(frame.shape[1] // 2, frame.shape[0] // 2) - 50
+    thickness = 20  # Thickness of the circle line
+    start_angle = 90  # Start angle (top of the circle)
+    end_angle = int(360 * progress) + start_angle  # End angle based on progress
+    
+    # cv.ellipse(frame, (center_x, center_y), (radius, radius), 0, start_angle, end_angle,
+    #             (255, 255, 255), thickness)
+
+def show_with_overlay_and_delay(frame):
+    # Create a white overlay image with the same dimensions as the input frame
+    overlay = np.ones_like(frame) * 255  # White overlay (all pixels set to white)
+
+    # Apply the overlay on the frame (use alpha blending)
+    alpha = 0.4  # Opacity of the overlay
+    cv.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+
+    # # Display the frame with overlay
+    # cv.imshow('Overlay', frame_with_overlay)
+    # cv.waitKey(500)  # Display overlay for 0.5 seconds (500 milliseconds)
+
+    # Close the overlay window
+    # cv.destroyWindow('Overlay')
+
+    # Display the original frame in a new window
+    # cv.imshow('Captured Image', frame)
+    # cv.waitKey(27)  # Wait indefinitely until a key is pressed
+
+    # Close all OpenCV windows
+    # cv.destroyAllWindows()
+
 
 
 if __name__ == '__main__':
